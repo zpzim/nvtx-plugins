@@ -22,6 +22,9 @@ from tensorflow.python.framework import ops
 
 from nvtx.plugins.tf.ext_utils import load_library
 from nvtx.plugins.tf.ext_utils import get_ext_suffix
+from tensorflow.python.ops.numpy_ops import np_config
+np_config.enable_numpy_behavior()
+
 
 __all__ = ['nvtx_tf_ops', 'start', 'end', 'trace']
 
@@ -36,32 +39,81 @@ def _maybe_convert_list_to_tensor(inputs):
         all([isinstance(x, tf.Tensor) for x in inputs]):
         inputs = tf.stack(inputs, axis=0, name="nvtx_trace_inputs")
         inputs_were_processed = True
+    elif isinstance(inputs, (list, tuple)) and \
+        all([isinstance(x, tf.RaggedTensor) for x in inputs]):
+        inputs = tf.stack(inputs, axis=0, name="nvtx_trace_inputs")
+        inputs_were_processed = True
 
-    assert isinstance(inputs, tf.Tensor)
+    assert isinstance(inputs, (tf.Tensor, tf.RaggedTensor))
 
     return inputs, inputs_were_processed
 
+def _unstack(value, axis=0):
+  if isinstance(value, tf.RaggedTensor):
+    leading_slices = (Ellipsis,) * axis
+    return [value.__getitem__(leading_slices+(i,)) for i in range(value.shape[axis])]
+  elif isinstance(value, tf.Tensor):
+    return tf.unstack(value, axis=axis)
+  return value
 
 @ops.RegisterGradient('NvtxStart')
-def _nvtx_start_grad(op, grad, marker_id, domain_handle):
+def _nvtx_start_grad(*grad_pack):
+    #print(grad_pack)
     # grad_message and grad_domain_name are not used
+    op = grad_pack[0]
+    grad = []
+    idx = []
+    for i in range(1,len(grad_pack)-2):
+      if grad_pack[i] is not None:
+        grad.append(grad_pack[i])
+        idx.append(True)
+      else:
+        idx.append(False)
+    #grad = [grad_pack[i] if grad_pack[i] is not None for i in range(1,len(grad_pack)-2)]
+    #= grad_pack[1:-2]
+    marker_id = grad_pack[-2]
+    domain_handle = grad_pack[-1]
+    #print('Start grad marker id = ', marker_id)
+    #print(grad)
     if not isinstance(marker_id, tf.Tensor) and marker_id is None:
         raise RuntimeError('Error in nvtx range %s. '
                            'Make sure all nvtx ranges are closed' % op.name)
 
+    if not grad:
+      grad = [tf.constant(0, dtype=tf.int64)]
     grad, null_grad = nvtx_tf_ops.nvtx_end(inputs=grad,
         marker_id=marker_id, domain_handle=domain_handle,
-        grad_message=op.inputs[2], grad_domain_name=op.inputs[3])
-    return [grad, null_grad, None, None]
-
+        grad_message=op.inputs[-2], grad_domain_name=op.inputs[-1])
+    final_grad = []
+    curr = 0
+    for i in range(len(grad_pack)-3):
+      if idx[i]:
+        final_grad.append(grad[curr])
+        curr += 1
+      else:
+        final_grad.append(None)
+    #print(final_grad)
+    #grad.append(null_grad)
+    #grad.append(None)
+    #grad.append(None)
+    #[null_grad, None, None]
+    #return grad
+    return [*final_grad, null_grad, None, None]
 
 @ops.RegisterGradient('NvtxEnd')
 def _nvtx_end_grad(op, grad, null_grad):
+    #print(grad)
+    added_list = False
+    if not isinstance(grad, (list, tuple)):
+      grad = [grad]
+      added_list = True
     grad, marker_id, domain_handle = nvtx_tf_ops.nvtx_start(
         inputs=grad, null_input=1.,
         message=op.inputs[3], domain_name=op.inputs[4])
+    #print('End grad marker id = ', marker_id)
+    if added_list:
+      grad = grad[0]
     return [grad, marker_id, domain_handle, None, None]
-
 
 def start(inputs, message, domain_name=None,
           grad_message=None, grad_domain_name=None,
@@ -115,22 +167,59 @@ def start(inputs, message, domain_name=None,
     null_input = 1.
 
     if trainable:
+        #null_input = tf.Variable(1., shape=(), dtype=tf.float32, name='nvtx_null_input', experimental_enable_variable_lifting=False, trainable=True)
         with tf.compat.v1.variable_scope("nvtx", reuse=tf.compat.v1.AUTO_REUSE):
+            #null_input = tf.Variable(1. shape=(), dtype=tf.float32, name='null_input')
             null_input = tf.compat.v1.get_variable('null_input', shape=(),
                                                    dtype=tf.float32,
                                                    initializer=tf.zeros_initializer,
                                                    trainable=True)
 
-    inputs, should_unstack = _maybe_convert_list_to_tensor(inputs)
+    added_list = False
+    if not isinstance(inputs, (list,tuple)):
+      added_list = True
+      inputs = [inputs]
 
-    inputs, marker_id, domain_handle = nvtx_tf_ops.nvtx_start(
-        inputs=inputs, null_input=null_input,
-        message=message, domain_name=domain_name, name=name)
+    if isinstance(inputs[0], tf.Tensor):
+      #inputs, should_unstack = _maybe_convert_list_to_tensor(inputs)
+      outputs, marker_id, domain_handle = nvtx_tf_ops.nvtx_start(inputs=inputs, null_input=null_input,
+          message=message, domain_name=domain_name, name=name)
+      #if should_unstack:
+      #  outputs = tf.unstack(inputs, axis=0)
+    elif isinstance(inputs[0], tf.RaggedTensor):
+      outputs = []
+      tensors = []
+      for elem in inputs:
+        tensors.append(elem.values)
+        tensors.append(elem.row_splits)
+      print('Tensors len', len(tensors))
+      tensors, marker_id, domain_handle = nvtx_tf_ops.nvtx_start(inputs=tensors, null_input=null_input,
+          message=message, domain_name=domain_name, name=name)
+      print('Fprop marker id generated: ', marker_id)
+      ''' 
+      row_splits, values, marker_id, domain_handle = nvtx_tf_ops.nvtx_start_ragged(
+        inputs_splits=row_splits, inputs_values=values, null_input=null_input,
+          message=message, domain_name=domain_name, name=name)
+      outputs.append(tf.RaggedTensor.from_row_splits(values, row_splits, validate=False))
+      for i in range(1, len(inputs)):
+        outputs.append(inputs[i])
+      '''
+      for i in range(0,len(tensors),2):
+        outputs.append(tf.RaggedTensor.from_row_splits(tensors[i], tensors[i+1], validate=False))
+      print('Tensors len', len(tensors))
+      print('Inputs len', len(inputs))
+      print('Outputs len', len(outputs))
 
-    if should_unstack:
-        inputs = tf.unstack(inputs, axis=0)
+    #if ragged:
+    #  inputs = tf.RaggedTensor.from_tensor(inputs)
 
-    return inputs, (marker_id, domain_handle, grad_message, grad_domain_name)
+    #if should_unstack:
+    #    inputs = _unstack(inputs)
+        #inputs = tf.unstack(inputs, axis=0)
+    if added_list:
+      outputs = outputs[0]
+
+    return outputs, (marker_id, domain_handle, grad_message, grad_domain_name)
 
 
 def end(inputs, nvtx_context, name=None):
@@ -165,18 +254,57 @@ def end(inputs, nvtx_context, name=None):
         return inputs
 
     marker_id, domain_handle, grad_message, grad_domain_name = nvtx_context
+    added_list = False
+    if not isinstance(inputs, (list,tuple)):
+      added_list = True
+      inputs = [inputs]
 
-    inputs, should_unstack = _maybe_convert_list_to_tensor(inputs)
+    if isinstance(inputs, tf.Tensor) or (isinstance(inputs, list) and isinstance(inputs[0], tf.Tensor)):
+      #inputs, should_unstack = _maybe_convert_list_to_tensor(inputs)
+      outputs, null_output = nvtx_tf_ops.nvtx_end(inputs=inputs,
+          marker_id=marker_id, domain_handle=domain_handle,
+          grad_message=grad_message, grad_domain_name=grad_domain_name, name=name
+      )
+      #if should_unstack:
+      #  outputs = tf.unstack(outputs, axis=0)
+    elif isinstance(inputs[0], tf.RaggedTensor):
+      outputs = []
+      tensors = []
+      for elem in inputs:
+        tensors.append(elem.values)
+        tensors.append(elem.row_splits)
+      print('Tensors len', len(tensors))
+      output, null_output = nvtx_tf_ops.nvtx_end(inputs=tensors,
+          marker_id=marker_id, domain_handle=domain_handle,
+          grad_message=grad_message, grad_domain_name=grad_domain_name, name=name
+      )
+      for i in range(0,len(tensors),2):
+        outputs.append(tf.RaggedTensor.from_row_splits(tensors[i], tensors[i+1], validate=False))
+      print('Tensors len', len(tensors))
+      print('Inputs len', len(inputs))
+      print('Outputs len', len(outputs))
+      '''
+      outputs = []
+      values = inputs[0].values
+      row_splits = inputs[0].row_splits
+      print(values.shape)
+      print(row_splits.shape)
+      row_splits, values, null_output = nvtx_tf_ops.nvtx_end_ragged(inputs_splits=row_splits, inputs_values=values,
+      #output, null_output = nvtx_tf_ops.nvtx_end(inputs=tf.constant(0, dtype=tf.int32),
+          marker_id=marker_id, domain_handle=domain_handle,
+          grad_message=grad_message, grad_domain_name=grad_domain_name, name=name
+      )
+      print(values.shape)
+      print(row_splits.shape)
+      outputs.append(tf.RaggedTensor.from_row_splits(values, row_splits, validate=False))
+      for i in range(1, len(inputs)):
+        outputs.append(inputs[i])
+      #inputs[0] = tf.RaggedTensor.from_row_splits(values, row_splits, validate=False)
+      '''
 
-    output, null_output = nvtx_tf_ops.nvtx_end(inputs=inputs,
-        marker_id=marker_id, domain_handle=domain_handle,
-        grad_message=grad_message, grad_domain_name=grad_domain_name, name=name
-    )
-
-    if should_unstack:
-        output = tf.unstack(output, axis=0)
-
-    return output
+    if added_list:
+      outputs = outputs[0]
+    return outputs
 
 
 def trace(message, domain_name=None,

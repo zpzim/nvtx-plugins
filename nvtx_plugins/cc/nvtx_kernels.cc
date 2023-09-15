@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 #include <map>
+#include <iostream>
 
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
@@ -80,13 +81,22 @@ class NvtxStartOp : public OpKernel {
 
   void Compute(OpKernelContext* context) override {
     // Ouput 0: Input => Output
+    for (int i = 0; i < context->num_inputs()-3; ++i) {
+      if (IsRefType(context->input_dtype(i))) {
+        context->forward_ref_input_to_ref_output(i, i);
+      } else {
+        context->set_output(i, context->input(i));
+      }
+    }
+    /*
+    // Ouput 0: Input => Output
     if (IsRefType(context->input_dtype(0))) {
       context->forward_ref_input_to_ref_output(0, 0);
     } else {
       context->set_output(0, context->input(0));
     }
-
-    // Inputs 1,2: message and domain_name
+    */
+    // Inputs 2,3: message and domain_name
     const Tensor *message_t, *domain_t;
     OP_REQUIRES_OK(context, context->input("message", &message_t));
     OP_REQUIRES(context, TensorShapeUtils::IsScalar(message_t->shape()),
@@ -108,12 +118,17 @@ class NvtxStartOp : public OpKernel {
 
     // get domain handle (create one if necessary)
     nvtxDomainHandle_t domain_handle = NVTX_DEFAULT_DOMAIN;
+    //if (!domain_name.empty() && domain_name != "Dummy") {
     if (!domain_name.empty()) {
       domain_handle = domain_registry.Register(domain_name);
     }
 
     // create nvtx marker
     nvtxRangeId_t marker_id;
+    //if (message == "Dummy") {
+    //  marker_id = 999999999;
+      //std::cout << "NVTX START DUMMY domain = " << domain_name << " message = " << message << " marker id = " << marker_id << std::endl;
+    //} else
     if (domain_handle != NVTX_DEFAULT_DOMAIN) {
       nvtxEventAttributes_t attr = {};
       attr.version = NVTX_VERSION;
@@ -123,8 +138,10 @@ class NvtxStartOp : public OpKernel {
       attr.message.ascii = message.c_str();
 
       marker_id = nvtxDomainRangeStartEx(domain_handle, &attr);
+      //std::cout << "NVTX START domain = " << domain_name << " message = " << attr.message.ascii << " marker id = " << marker_id << std::endl;
     } else {
       marker_id = nvtxRangeStart(message.c_str());
+      //std::cout << "NVTX START domain = " << domain_name << " message = " << message << " marker id = " << marker_id << std::endl;
     }
 
     // push marker_id and domain_handle to outputs 1 and 2
@@ -152,26 +169,41 @@ class NvtxEndOp : public OpKernel {
   explicit NvtxEndOp(OpKernelConstruction* context) : OpKernel(context) {}
 
   void Compute(OpKernelContext* context) override {
+    //std::cout << "in nvtx END COMPUTE" << std::endl;
     // Ouput 0: Input => Output
+    for (int i = 0; i < context->num_inputs()-4; ++i) {
+      if (IsRefType(context->input_dtype(i))) {
+        context->forward_ref_input_to_ref_output(i, i);
+      } else {
+        context->set_output(i, context->input(i));
+      }
+    }
+    /*
     if (IsRefType(context->input_dtype(0))) {
       context->forward_ref_input_to_ref_output(0, 0);
     } else {
       context->set_output(0, context->input(0));
     }
-
+    */
     // Close NVTX range
     const Tensor *marker_t, *domain_t;
+
     OP_REQUIRES_OK(context, context->input("marker_id", &marker_t));
     OP_REQUIRES_OK(context, context->input("domain_handle", &domain_t));
     auto marker_id = marker_t->scalar<int64>()();
     auto domain_handle = reinterpret_cast<nvtxDomainHandle_t>(
       marker_t->scalar<int64>()());
+    //std::cout << "NVTX END marker id = " << marker_id << std::endl;
 
+    //if (marker_id != 999999999) {
     if (domain_handle != NVTX_DEFAULT_DOMAIN) {
       nvtxDomainRangeEnd(domain_handle, marker_id);
     } else {
       nvtxRangeEnd(marker_id);
     }
+    //} else {
+    //  std::cout << "NVTX END DUMMY marker" << std::endl;
+    //}
 
     Tensor *output_null_output = nullptr;
     OP_REQUIRES_OK(context,
@@ -183,7 +215,6 @@ class NvtxEndOp : public OpKernel {
 
   bool IsExpensive() override { return false; }
 };
-
 
 #define REGISTER_GPU_KERNEL(type)                                 \
   REGISTER_KERNEL_BUILDER(Name("NvtxStart")                       \
@@ -201,7 +232,7 @@ class NvtxEndOp : public OpKernel {
                               .HostMemory("grad_message")         \
                               .HostMemory("grad_domain_name")     \
                               .TypeConstraint<type>("T"),         \
-                          NvtxEndOp<type>);
+                          NvtxEndOp<type>);                       
 
 TF_CALL_NUMBER_TYPES(REGISTER_GPU_KERNEL);
 #undef REGISTER_GPU_KERNEL

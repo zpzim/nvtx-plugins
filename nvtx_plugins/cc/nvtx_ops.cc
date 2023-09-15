@@ -16,11 +16,9 @@ limitations under the License.
 
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/shape_inference.h"
+#include "tensorflow/core/framework/common_shape_fns.h"
 
 using namespace tensorflow;
-
-// TODO(ahmadki): marker_id and domain handle should be uint64, but int64
-// might cause op placement issues.
 REGISTER_OP("NvtxStart")
     .Input("inputs: T")
     .Input("null_input: float32")
@@ -29,16 +27,19 @@ REGISTER_OP("NvtxStart")
     .Output("output: T")
     .Output("marker_id: int64")
     .Output("domain_handle: int64")
-    .Attr("T: type")
+    //.Attr("T: list({int32, int64, float32})")
+    .Attr("T: list({int32, int64, float32}) >= 0")
     .SetShapeFn([](shape_inference::InferenceContext* c) {
-      c->set_output(0, c->input(0));
-      auto* handle_data = c->input_handle_shapes_and_types(0);
-      if (handle_data != nullptr) {
-        c->set_output_handle_shapes_and_types(0, *handle_data);
+      for(int i = 0; i < c->num_inputs() - 3; ++i) {
+        c->set_output(i, c->input(i));
+        auto* handle_data = c->input_handle_shapes_and_types(i);
+        if (handle_data != nullptr) {
+          c->set_output_handle_shapes_and_types(i, *handle_data);
+        }
       }
-      c->set_output(1, c->Scalar());
-      c->set_output(2, c->Scalar());
-      return Status::OK();
+      c->set_output(c->num_inputs()-3, c->Scalar());
+      c->set_output(c->num_inputs()-2, c->Scalar());
+      return OkStatus();
     })
     .Doc(R"doc(
 An identity graph node with a side effect of opening an NVTX marker.
@@ -65,15 +66,25 @@ REGISTER_OP("NvtxEnd")
     .Input("grad_domain_name: string")
     .Output("output: T")
     .Output("null_output: float32")
-    .Attr("T: type")
+    .Attr("T: list({int32, int64, float32}) >= 0")
+    //.Attr("T: list(type) >= 0 = []")
     .SetShapeFn([](shape_inference::InferenceContext* c) {
+      for(int i = 0; i < c->num_inputs() - 4; ++i) {
+        c->set_output(i, c->input(i));
+        auto* handle_data = c->input_handle_shapes_and_types(i);
+        if (handle_data != nullptr) {
+          c->set_output_handle_shapes_and_types(i, *handle_data);
+        }
+      }
+      /*
       c->set_output(0, c->input(0));
       auto* handle_data = c->input_handle_shapes_and_types(0);
       if (handle_data != nullptr) {
         c->set_output_handle_shapes_and_types(0, *handle_data);
       }
-      c->set_output(1, c->Scalar());
-      return Status::OK();
+      */
+      c->set_output(c->num_inputs() - 4, c->Scalar());
+      return OkStatus();
     })
     .Doc(R"doc(
 An identity graph node with a side effect of closing an NVTX marker.
@@ -91,3 +102,4 @@ Output
     null_output: A `float32 Tensor` object used as a trick to force gradient
                  calculation. The tesnor is not used inside the op.
 )doc");
+
